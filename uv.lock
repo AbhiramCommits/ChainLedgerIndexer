@@ -360,6 +360,7 @@ dependencies = [
     { name = "tenacity" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "web3" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -382,6 +383,7 @@ requires-dist = [
     { name = "tenacity" },
     { name = "uvicorn", extras = ["standard"] },
     { name = "web3", specifier = ">=6" },
+    { name = "websockets", specifier = ">=12" },
 ]
 
 [package.metadata.requires-dev]
