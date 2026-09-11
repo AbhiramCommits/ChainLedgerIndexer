@@ -2,10 +2,10 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Iterable
-from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from web3 import Web3
 
@@ -17,7 +17,13 @@ from chainledger.indexer.decoder import (
     load_erc20_abi,
 )
 from chainledger.indexer.rpc import batch_get_block_timestamps
-from chainledger.indexer.writer import get_cursor, set_cursor, upsert_transfers
+from chainledger.indexer.writer import (
+    build_transfer_rows,
+    get_cursor,
+    record_coverage,
+    set_cursor,
+    upsert_transfers,
+)
 from chainledger.models import Token
 
 logger = structlog.get_logger()
@@ -109,7 +115,12 @@ class IndexerService:
             return
         symbol, decimals = self._fetch_token_metadata(token)
         if existing is None:
-            session.add(Token(address=token, symbol=symbol, name=symbol, decimals=decimals))
+            # ON CONFLICT DO NOTHING: concurrent workers (backfill) may race
+            # to register the same token; only one row may exist.
+            stmt = pg_insert(Token).values(
+                address=token, symbol=symbol, name=symbol, decimals=decimals
+            )
+            session.execute(stmt.on_conflict_do_nothing(index_elements=["address"]))
             session.commit()
             logger.info("token registered", token=token, symbol=symbol, decimals=decimals)
         else:
@@ -157,26 +168,16 @@ class IndexerService:
             raw_logs = self.fetch_range(token, current + 1, to_block)
             decoded = [d for d in (self.decoder.decode(log) for log in raw_logs) if d is not None]
             timestamps = self.block_times(d.block_number for d in decoded)
-            rows = [
-                {
-                    "tx_hash": d.tx_hash,
-                    "log_index": d.log_index,
-                    "block_number": d.block_number,
-                    "block_time": datetime.fromtimestamp(timestamps[d.block_number], tz=UTC),
-                    "token_address": d.token_address,
-                    "from_address": d.from_address,
-                    "to_address": d.to_address,
-                    "value": d.value,
-                }
-                for d in decoded
-            ]
+            rows = build_transfer_rows(decoded, timestamps)
 
-            # Cursor advance shares the transaction with the inserts: both are
-            # committed (or rolled back) together, so the cursor can never
-            # pass unwritten data even if the process crashes mid-batch.
+            # Cursor advance and coverage record share the transaction with
+            # the inserts: all are committed (or rolled back) together, so the
+            # cursor can never pass unwritten data even if the process crashes
+            # mid-batch.
             with self.session_factory() as session:
                 inserted, skipped = upsert_transfers(session, rows)
                 set_cursor(session, token, to_block)
+                record_coverage(session, token, current + 1, to_block)
                 session.commit()
 
             duration_ms = (time.monotonic() - started) * 1000

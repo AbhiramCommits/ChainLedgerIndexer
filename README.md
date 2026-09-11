@@ -98,11 +98,59 @@ docker compose exec foundry cast send <address> "transfer(address,uint256)" \
   --rpc-url http://127.0.0.1:8545
 ```
 
+## API
+
+REST API on `localhost:8000`. All amounts are serialized as decimal strings:
+`value` is the raw uint256, `value_decimal` is formatted with the token's
+decimals (never floats, so JS clients lose no precision).
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /health` | status, chain head, latest DB block and `blocks_behind` per token |
+| `GET /tokens` | indexed tokens with symbol/decimals and transfer count |
+| `GET /transfers` | filters: `token`, `from_address`, `to_address`, `address` (matches from OR to), `from_block`, `to_block`, `start_time`, `end_time`; cursor pagination via `limit` (default 50, max 500) and `cursor` |
+| `GET /transfers/{tx_hash}` | all transfers in a transaction |
+| `GET /addresses/{address}/balance-delta?token=...` | net inflow minus outflow computed in SQL |
+
+- Ordering is `block_number DESC, log_index DESC`; `next_cursor` is an opaque
+  base64 keyset cursor. Pagination uses keyset cursors rather than OFFSET:
+  OFFSET cost degrades linearly with page depth, while the cursor rides the
+  `(block_number DESC, log_index DESC)` index at constant cost per page.
+- Address parameters are validated with `Web3.is_address` and normalized to
+  lowercase; invalid values (and `from_block > to_block`) return 422.
+
+**`balance-delta` caveat**: this is the net flow over the *indexed block
+range* only — the sum of transfers the indexer has seen. It is NOT the
+canonical on-chain balance (which would also include the indexed range's
+starting balance and any events the indexer has not covered, e.g. mints
+outside the configured start block).
+
+## Backfill
+
+Re-index a historical range, reusing the live indexer's `fetch_range` and
+`upsert_transfers` paths:
+
+```bash
+python -m chainledger.backfill --token 0x... --from-block 1000 --to-block 5000 --workers 4
+```
+
+- Splits the range into chunks across a worker thread pool, with a progress
+  bar and a final summary (blocks scanned, logs decoded, rows inserted, rows
+  already present, skipped logs).
+- Writes are `ON CONFLICT DO NOTHING`, so a second run over the same range
+  inserts 0 rows; the summary asserts this explicitly when the range was
+  already covered (`idempotency: PASSED`).
+- `--gap-scan` finds block ranges below the indexer cursor with no coverage
+  record (in `indexed_ranges`) and re-indexes only those. It needs
+  `--from-block`/`--to-block` neither.
+
 ## Data model
 
 - `tokens` — ERC-20 metadata (address PK, symbol, decimals, name)
 - `transfers` — Transfer events; unique on `(tx_hash, log_index)` for idempotent
   writes; `value` stored as `NUMERIC(78,0)` (raw uint256, never float)
 - `indexer_cursors` — per-token `last_indexed_block` for resume/resync
+- `indexed_ranges` — coverage records per (token, block range), written in the
+  same transaction as the transfers; used by backfill `--gap-scan`
 
 All addresses and tx hashes are normalized to lowercase.

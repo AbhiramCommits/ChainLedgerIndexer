@@ -1,11 +1,31 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from chainledger.models import IndexerCursor, Transfer
+from chainledger.indexer.decoder import DecodedTransfer
+from chainledger.models import IndexedRange, IndexerCursor, Transfer
+
+
+def build_transfer_rows(
+    decoded: Sequence[DecodedTransfer], timestamps: Mapping[int, int]
+) -> list[dict[str, Any]]:
+    """Map decoded transfers + block timestamps to insert-ready row dicts."""
+    return [
+        {
+            "tx_hash": d.tx_hash,
+            "log_index": d.log_index,
+            "block_number": d.block_number,
+            "block_time": datetime.fromtimestamp(timestamps[d.block_number], tz=UTC),
+            "token_address": d.token_address,
+            "from_address": d.from_address,
+            "to_address": d.to_address,
+            "value": d.value,
+        }
+        for d in decoded
+    ]
 
 
 def upsert_transfers(session: Session, rows: Sequence[dict[str, Any]]) -> tuple[int, int]:
@@ -52,3 +72,18 @@ def set_cursor(session: Session, token_address: str, last_indexed_block: int) ->
 def get_cursor(session: Session, token_address: str) -> int | None:
     row = session.get(IndexerCursor, token_address)
     return row.last_indexed_block if row is not None else None
+
+
+def record_coverage(session: Session, token_address: str, from_block: int, to_block: int) -> None:
+    """Record that a block range was successfully indexed.
+
+    Idempotent (ON CONFLICT DO NOTHING); used by the live indexer and by
+    backfill --gap-scan to find uncovered ranges below the cursor.
+    """
+    stmt = pg_insert(IndexedRange).values(
+        token_address=token_address,
+        from_block=from_block,
+        to_block=to_block,
+    )
+    stmt = stmt.on_conflict_do_nothing(index_elements=["token_address", "from_block", "to_block"])
+    session.execute(stmt)

@@ -26,6 +26,7 @@ class Transfer(Base):
         Index("ix_transfers_to_block", "to_address", desc("block_number")),
         Index("ix_transfers_token_block", "token_address", desc("block_number")),
         Index("ix_transfers_block_number", "block_number"),
+        Index("ix_transfers_block_log", desc("block_number"), desc("log_index")),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -49,3 +50,25 @@ class IndexerCursor(Base):
     token_address: Mapped[str] = mapped_column(Text, primary_key=True)
     last_indexed_block: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
+
+
+class IndexedRange(Base):
+    """Coverage record: one row per successfully indexed (token, block range).
+
+    Backfill --gap-scan uses these rows to find blocks below the cursor that
+    were never indexed (e.g. historical DB truncation or a manual cursor
+    reset) and re-indexes only the uncovered ranges.
+    """
+
+    __tablename__ = "indexed_ranges"
+    __table_args__ = (
+        UniqueConstraint(
+            "token_address", "from_block", "to_block", name="uq_indexed_ranges_token_range"
+        ),
+        Index("ix_indexed_ranges_token_from", "token_address", "from_block"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    token_address: Mapped[str] = mapped_column(Text)
+    from_block: Mapped[int] = mapped_column(BigInteger)
+    to_block: Mapped[int] = mapped_column(BigInteger)

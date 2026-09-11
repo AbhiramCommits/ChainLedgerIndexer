@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Real-time Ethereum ERC-20 Transfer event indexer with a REST API"
 requires-python = ">=3.11"
 dependencies = [
+    "eth-utils>=4",
     "web3>=6",
     "fastapi",
     "uvicorn[standard]",
@@ -13,6 +14,7 @@ dependencies = [
     "pydantic-settings",
     "structlog",
     "tenacity",
+    "tqdm",
     "websockets>=12",
 ]
 
@@ -23,6 +25,7 @@ dev = [
     "httpx",
     "ruff",
     "mypy",
+    "types-tqdm",
 ]
 
 [build-system]
