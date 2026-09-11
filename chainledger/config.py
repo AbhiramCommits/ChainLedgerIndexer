@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     confirmations: int = Field(default=5, ge=0)
     poll_interval_seconds: float = Field(default=3.0, gt=0)
     batch_size: int = Field(default=500, ge=1, le=10000)
+    metrics_port: int = Field(default=8001, ge=1, le=65535)
 
     @property
     def token_addresses(self) -> list[str]:

@@ -4,7 +4,7 @@ from chainledger.indexer import __main__ as main_mod
 
 
 def test_main_wiring(monkeypatch):
-    settings = SimpleNamespace(rpc_url="http://fake")
+    settings = SimpleNamespace(rpc_url="http://fake", metrics_port=8001)
     sentinel = object()
     events: list[object] = []
 
@@ -17,6 +17,7 @@ def test_main_wiring(monkeypatch):
 
     monkeypatch.setattr(main_mod, "get_settings", lambda: settings)
     monkeypatch.setattr(main_mod, "make_client", lambda url: sentinel)
+    monkeypatch.setattr(main_mod, "start_http_server", lambda port, addr=None: None)
     monkeypatch.setattr(main_mod, "IndexerService", FakeService)
     main_mod.main()
     assert events == [("init", settings, sentinel), "run_forever"]

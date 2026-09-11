@@ -94,6 +94,13 @@ async def test_health(db_session, api_client):
     assert tokens[A]["blocks_behind"] == 95
 
 
+async def test_metrics_endpoint(api_client):
+    resp = await api_client.get("/metrics")
+    assert resp.status_code == 200
+    assert "chainledger_request_latency_seconds" in resp.text
+    assert "python_info" in resp.text
+
+
 async def test_health_degraded_when_rpc_down(db_engine, clean_db):
     class BrokenEth:
         @property

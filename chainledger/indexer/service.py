@@ -24,6 +24,7 @@ from chainledger.indexer.writer import (
     set_cursor,
     upsert_transfers,
 )
+from chainledger.metrics import BLOCKS_BEHIND, BLOCKS_INDEXED, TRANSFERS_INDEXED
 from chainledger.models import Token
 
 logger = structlog.get_logger()
@@ -158,6 +159,7 @@ class IndexerService:
         latest = self.w3.eth.block_number
         safe_head = latest - self.settings.confirmations
         if safe_head <= current:
+            BLOCKS_BEHIND.set(max(0, latest - current))
             return
 
         while current < safe_head:
@@ -180,6 +182,11 @@ class IndexerService:
                 set_cursor(session, token, to_block)
                 record_coverage(session, token, current + 1, to_block)
                 session.commit()
+
+            blocks = to_block - current
+            BLOCKS_INDEXED.labels(token).inc(blocks)
+            TRANSFERS_INDEXED.labels(token).inc(inserted)
+            BLOCKS_BEHIND.set(max(0, latest - to_block))
 
             duration_ms = (time.monotonic() - started) * 1000
             logger.info(

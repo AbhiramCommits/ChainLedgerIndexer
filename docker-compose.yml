@@ -26,6 +26,19 @@ services:
         aliases:
           - anvil
 
+  migrate:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_URL: postgresql+psycopg://${POSTGRES_USER:-chainledger}:${POSTGRES_PASSWORD:-chainledger}@postgres:5432/${POSTGRES_DB:-chainledger}
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     env_file:
@@ -37,8 +50,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   indexer:
     build: .
@@ -49,9 +62,17 @@ services:
       DB_URL: postgresql+psycopg://${POSTGRES_USER:-chainledger}:${POSTGRES_PASSWORD:-chainledger}@postgres:5432/${POSTGRES_DB:-chainledger}
       RPC_URL: http://anvil:8545
     command: ["python", "-m", "chainledger.indexer"]
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/metrics',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       foundry:
         condition: service_started
 

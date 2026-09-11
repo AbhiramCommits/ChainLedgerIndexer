@@ -21,6 +21,8 @@ from web3.types import RPCEndpoint, RPCResponse
 from websockets.asyncio.client import connect as ws_connect
 from websockets.protocol import State
 
+from chainledger.metrics import RPC_ERRORS
+
 logger = structlog.get_logger()
 
 MAX_ATTEMPTS = 5
@@ -52,6 +54,7 @@ def is_retryable(exc: BaseException) -> bool:
 
 
 def _log_retry(retry_state: RetryCallState) -> None:
+    RPC_ERRORS.inc()
     exc = retry_state.outcome.exception() if retry_state.outcome else None
     wait = getattr(retry_state.next_action, "sleep", None)
     logger.warning(
