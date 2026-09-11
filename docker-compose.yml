@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-chainledger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chainledger}
+      POSTGRES_DB: ${POSTGRES_DB:-chainledger}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chainledger} -d ${POSTGRES_DB:-chainledger}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  foundry:
+    image: ghcr.io/foundry-rs/foundry:latest
+    command: ["anvil", "--host", "0.0.0.0"]
+    ports:
+      - "8545:8545"
+
+  api:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_URL: postgresql+psycopg://${POSTGRES_USER:-chainledger}:${POSTGRES_PASSWORD:-chainledger}@postgres:5432/${POSTGRES_DB:-chainledger}
+      RPC_URL: http://anvil:8545
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  indexer:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_URL: postgresql+psycopg://${POSTGRES_USER:-chainledger}:${POSTGRES_PASSWORD:-chainledger}@postgres:5432/${POSTGRES_DB:-chainledger}
+      RPC_URL: http://anvil:8545
+    command: ["python", "-m", "chainledger.indexer"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      foundry:
+        condition: service_started
+
+volumes:
+  pgdata:
