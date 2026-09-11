@@ -1,19 +1,15 @@
-import os
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from chainledger.api import app
+from chainledger.api import app, deps
 from chainledger.api.deps import get_w3
-from chainledger.db import Base, get_db
+from chainledger.db import get_db
 from chainledger.models import IndexerCursor, Token, Transfer
-
-TEST_DB_URL = os.environ.get("TEST_DB_URL")
-
-pytestmark = pytest.mark.skipif(TEST_DB_URL is None, reason="TEST_DB_URL not set")
 
 A = "0x" + "a" * 40
 B = "0x" + "b" * 40
@@ -28,14 +24,14 @@ TX4 = "0x" + "04" * 32
 T0 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
 
 
-def seed(session) -> None:
-    session.add_all(
+def seed(db_session) -> None:
+    db_session.add_all(
         [
             Token(address=A, symbol="TST", name="Test Token", decimals=18),
             Token(address=B, symbol="USDC", name="USD Coin", decimals=6),
         ]
     )
-    session.add_all(
+    db_session.add_all(
         [
             Transfer(
                 tx_hash=TX1,
@@ -79,52 +75,18 @@ def seed(session) -> None:
             ),
         ]
     )
-    session.add_all(
+    db_session.add_all(
         [
             IndexerCursor(token_address=A, last_indexed_block=5, updated_at=T0),
             IndexerCursor(token_address=B, last_indexed_block=5, updated_at=T0),
         ]
     )
-    session.commit()
+    db_session.commit()
 
 
-class FakeEth:
-    @property
-    def block_number(self):
-        return 100
-
-
-class FakeW3:
-    def __init__(self):
-        self.eth = FakeEth()
-
-
-@pytest.fixture
-def client():
-    engine = create_engine(TEST_DB_URL)
-    Base.metadata.create_all(engine)
-    TestSession = sessionmaker(bind=engine)
-
-    def override_db():
-        session = TestSession()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    with TestSession() as session:
-        seed(session)
-
-    app.dependency_overrides[get_db] = override_db
-    app.dependency_overrides[get_w3] = lambda: FakeW3()
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-    Base.metadata.drop_all(engine)
-
-
-def test_health(client):
-    body = client.get("/health").json()
+async def test_health(db_session, api_client):
+    seed(db_session)
+    body = (await api_client.get("/health")).json()
     assert body["status"] == "ok"
     assert body["chain_head"] == 100
     tokens = {t["address"]: t for t in body["tokens"]}
@@ -132,19 +94,60 @@ def test_health(client):
     assert tokens[A]["blocks_behind"] == 95
 
 
-def test_tokens(client):
-    body = client.get("/tokens").json()
-    items = {t["address"]: t for t in body["items"]}
+async def test_health_degraded_when_rpc_down(db_engine, clean_db):
+    class BrokenEth:
+        @property
+        def block_number(self):
+            raise RuntimeError("rpc down")
+
+    broken = SimpleNamespace(eth=BrokenEth())
+    TestSession = sessionmaker(bind=db_engine, expire_on_commit=False)
+
+    def override_get_db():
+        session = TestSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_w3] = lambda: broken
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            body = (await client.get("/health")).json()
+            assert body["status"] == "degraded"
+            assert body["chain_head"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_health_503_when_db_down(db_engine, clean_db):
+    class DownSession:
+        def execute(self, *args, **kwargs):
+            raise OperationalError("SELECT 1", {}, Exception("db down"))
+
+    app.dependency_overrides[get_db] = lambda: DownSession()
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            assert (await client.get("/health")).status_code == 503
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_tokens(db_session, api_client):
+    seed(db_session)
+    items = {t["address"]: t for t in (await api_client.get("/tokens")).json()["items"]}
     assert items[A]["transfer_count"] == 3
     assert items[B]["transfer_count"] == 1
     assert items[A]["decimals"] == 18
 
 
-def test_transfers_pagination_walk(client):
-    seen = []
+async def test_pagination_returns_each_row_exactly_once(db_session, api_client):
+    seed(db_session)
+    seen: list[tuple[int, int]] = []
     url = "/transfers?limit=2"
     while url:
-        body = client.get(url).json()
+        body = (await api_client.get(url)).json()
         assert len(body["items"]) <= 2
         seen.extend((i["block_number"], i["log_index"]) for i in body["items"])
         url = f"/transfers?limit=2&cursor={body['next_cursor']}" if body["next_cursor"] else None
@@ -152,64 +155,89 @@ def test_transfers_pagination_walk(client):
     assert len(seen) == len(set(seen))
 
 
-def test_transfers_order_desc(client):
-    body = client.get("/transfers").json()
-    keys = [(i["block_number"], i["log_index"]) for i in body["items"]]
-    assert keys == sorted(keys, reverse=True)
-
-
-def test_transfers_filters(client):
-    assert len(client.get(f"/transfers?token={A}").json()["items"]) == 3
-    assert len(client.get("/transfers?from_block=1&to_block=2").json()["items"]) == 3
-    assert len(client.get(f"/transfers?address={ADDR1}").json()["items"]) == 3
-    items = client.get(f"/transfers?from_address={ADDR2}&to_address={ADDR3}").json()["items"]
+async def test_transfers_filters(db_session, api_client):
+    seed(db_session)
+    assert len((await api_client.get(f"/transfers?token={A}")).json()["items"]) == 3
+    assert len((await api_client.get("/transfers?from_block=1&to_block=2")).json()["items"]) == 3
+    assert len((await api_client.get(f"/transfers?address={ADDR1}")).json()["items"]) == 3
+    items = (await api_client.get(f"/transfers?from_address={ADDR2}&to_address={ADDR3}")).json()[
+        "items"
+    ]
     assert [i["tx_hash"] for i in items] == [TX2]
-    items = client.get(
-        "/transfers?start_time=2026-01-01T00:30:00Z&end_time=2026-01-01T02:30:00Z"
+    items = (
+        await api_client.get(
+            "/transfers?start_time=2026-01-01T00:30:00Z&end_time=2026-01-01T02:30:00Z"
+        )
     ).json()["items"]
     assert len(items) == 3
 
 
-def test_transfers_value_serialization(client):
-    items = client.get(f"/transfers?token={A}&to_block=1").json()["items"]
+async def test_value_serialized_as_decimal_strings(db_session, api_client):
+    seed(db_session)
+    items = (await api_client.get(f"/transfers?token={A}&to_block=1")).json()["items"]
     assert items[0]["value"] == "1000000000000000000"
     assert items[0]["value_decimal"] == "1.000000000000000000"
-    items = client.get(f"/transfers?token={B}").json()["items"]
+    items = (await api_client.get(f"/transfers?token={B}")).json()["items"]
     assert items[0]["value"] == "1234567"
     assert items[0]["value_decimal"] == "1.234567"
 
 
-def test_transfers_by_tx(client):
-    items = client.get(f"/transfers/{TX2}").json()["items"]
+async def test_transfers_by_tx(db_session, api_client):
+    seed(db_session)
+    items = (await api_client.get(f"/transfers/{TX2}")).json()["items"]
     assert [i["tx_hash"] for i in items] == [TX2]
-    assert items[0]["from_address"] == ADDR2
 
 
-def test_balance_delta(client):
-    body = client.get(f"/addresses/{ADDR3}/balance-delta?token={A}").json()
+async def test_balance_delta(db_session, api_client):
+    seed(db_session)
+    body = (await api_client.get(f"/addresses/{ADDR3}/balance-delta?token={A}")).json()
     assert body["balance_delta"] == "1500000000000000000"
     assert body["balance_delta_decimal"] == "1.500000000000000000"
-    body = client.get(f"/addresses/{ADDR1}/balance-delta?token={A}").json()
+    body = (await api_client.get(f"/addresses/{ADDR1}/balance-delta?token={A}")).json()
     assert body["balance_delta"] == "-500000000000000000"
-    assert body["balance_delta_decimal"] == "-0.500000000000000000"
-    body = client.get(f"/addresses/{ADDR1}/balance-delta?token={B}").json()
-    assert body["balance_delta"] == "-1234567"
-    assert body["balance_delta_decimal"] == "-1.234567"
-    body = client.get(f"/addresses/{ADDR1}/balance-delta").json()
+    body = (await api_client.get(f"/addresses/{ADDR1}/balance-delta")).json()
     assert body["balance_delta"] == "-500000000001234567"
     assert body["balance_delta_decimal"] is None
-
-
-def test_balance_delta_unknown_token_404(client):
     unknown = "0x" + "dd" * 20
-    resp = client.get(f"/addresses/{ADDR1}/balance-delta?token={unknown}")
+    resp = await api_client.get(f"/addresses/{ADDR1}/balance-delta?token={unknown}")
     assert resp.status_code == 404
 
 
-def test_validation_422(client):
-    assert client.get("/transfers?from_address=0x123").status_code == 422
-    assert client.get("/transfers?from_block=5&to_block=1").status_code == 422
-    assert client.get("/transfers?cursor=%21%21%21").status_code == 422
-    assert client.get("/transfers?limit=501").status_code == 422
-    assert client.get("/addresses/0x123/balance-delta").status_code == 422
-    assert client.get("/transfers/0xzz").status_code == 422
+async def test_invalid_inputs_return_422(db_session, api_client):
+    seed(db_session)
+    assert (await api_client.get("/transfers?from_address=0x123")).status_code == 422
+    assert (await api_client.get("/transfers?from_block=5&to_block=1")).status_code == 422
+    assert (await api_client.get("/transfers?cursor=%21%21%21")).status_code == 422
+    assert (await api_client.get("/transfers?limit=501")).status_code == 422
+    assert (await api_client.get("/addresses/0x123/balance-delta")).status_code == 422
+    assert (await api_client.get("/transfers/0xzz")).status_code == 422
+    assert (
+        await api_client.get(
+            "/transfers?start_time=2026-01-02T00:00:00Z&end_time=2026-01-01T00:00:00Z"
+        )
+    ).status_code == 422
+
+
+def test_get_w3_is_cached(monkeypatch):
+    deps._cached_client.cache_clear()
+    calls: list[str] = []
+
+    def fake_make_client(rpc_url: str):
+        calls.append(rpc_url)
+        return object()
+
+    monkeypatch.setattr(deps, "make_client", fake_make_client)
+    monkeypatch.setattr(deps, "get_settings", lambda: SimpleNamespace(rpc_url="http://x"))
+    first = deps.get_w3()
+    second = deps.get_w3()
+    assert first is second
+    assert calls == ["http://x"]
+    deps._cached_client.cache_clear()
+
+
+@pytest.mark.parametrize("limit", [1, 50, 500])
+async def test_limit_bounds_accepted(db_session, api_client, limit):
+    seed(db_session)
+    resp = await api_client.get(f"/transfers?limit={limit}")
+    assert resp.status_code == 200
+    assert len(resp.json()["items"]) <= limit

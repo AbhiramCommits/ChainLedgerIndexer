@@ -98,12 +98,13 @@ class IndexerService:
         missing = [n for n in unique if n not in self._block_time_cache]
         if missing:
             self._block_time_cache.update(batch_get_block_timestamps(self.w3, missing))
+        result = {n: self._block_time_cache[n] for n in unique}
         if len(self._block_time_cache) > _BLOCK_TIME_CACHE_LIMIT:
             cutoff = max(self._block_time_cache) - _BLOCK_TIME_CACHE_LIMIT // 2
             self._block_time_cache = {
                 n: ts for n, ts in self._block_time_cache.items() if n >= cutoff
             }
-        return {n: self._block_time_cache[n] for n in unique}
+        return result
 
     # -- token metadata -------------------------------------------------------
 

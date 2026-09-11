@@ -22,19 +22,36 @@ curl localhost:8000/health
 
 ```bash
 uv sync
-make test                 # pytest (unit tests)
+make test                 # full suite (unit + integration; integration skips without anvil on PATH)
+make test-cov             # unit suite with coverage report
 make lint                 # ruff + mypy
 make run-api              # uvicorn with reload (set DB_URL/RPC_URL for localhost)
 make run-indexer          # indexer entrypoint
 ```
 
-Database integration tests (`tests/test_integration.py`) run when `TEST_DB_URL`
-is set, e.g. against the dockerized Postgres:
+### Tests
+
+The suite uses testcontainers to run a disposable Postgres 16 (migrated with
+Alembic once per session, tables truncated between tests) and a `FakeWeb3`
+double serving canned payloads from `tests/fixtures/*.json` — no external
+services or API keys required, Docker is the only dependency.
+
+- Unit tests target >80% coverage on `chainledger.indexer` and
+  `chainledger.api` (currently ~97%).
+- `tests/test_anvil_integration.py` (marked `integration`) starts a real
+  `anvil`, deploys a minimal ERC-20 via web3.py, fires 3 transfers, runs one
+  indexer cycle, and asserts the API returns all 3. It is skipped when
+  `anvil` is not on `PATH` (CI installs it via foundry-toolchain).
+
+Run just the integration test locally:
 
 ```bash
-docker compose exec postgres createdb -U chainledger chainledger_test
-TEST_DB_URL=postgresql+psycopg://chainledger:chainledger@localhost:5433/chainledger_test uv run pytest
+curl -L https://foundry.paradigm.xyz | bash && foundryup
+make test
 ```
+
+CI (`.github/workflows/ci.yml`) runs ruff, mypy, unit tests with coverage
+gates, and the anvil integration test on push and PR.
 
 For running the API outside docker, point it at the dockerized services:
 

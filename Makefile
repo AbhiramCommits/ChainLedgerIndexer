@@ -1,4 +1,4 @@
-.PHONY: up down migrate test lint run-api run-indexer
+.PHONY: up down migrate test test-cov lint run-api run-indexer
 
 up:
 	@test -f .env || cp .env.example .env
@@ -12,6 +12,9 @@ migrate:
 
 test:
 	uv run pytest
+
+test-cov:
+	uv run pytest -m "not integration" --cov=chainledger.indexer --cov=chainledger.api --cov-report=term-missing
 
 lint:
 	uv run ruff check .

@@ -5,9 +5,13 @@ import threading
 
 import pytest
 import requests
+from tenacity import wait_none
 from web3.exceptions import ContractLogicError, RequestTimedOut, Web3RPCError
+from web3.providers import HTTPProvider
+from web3.types import RPCEndpoint
 from websockets.asyncio.server import serve
 
+from chainledger.indexer import rpc as rpc_module
 from chainledger.indexer.rpc import (
     RetryingHTTPProvider,
     RetryingWebSocketProvider,
@@ -83,6 +87,86 @@ def test_batch_get_block_timestamps_error():
         batch_get_block_timestamps(FakeWeb3(provider), [1])
 
 
+def test_batch_get_block_timestamps_entry_error():
+    provider = FakeProvider({})
+
+    def error_entry(requests):
+        return [
+            {"id": i, "error": {"code": -32000, "message": "boom"}} for i, _ in enumerate(requests)
+        ]
+
+    provider.make_batch_request = error_entry  # type: ignore[method-assign]
+    with pytest.raises(Web3RPCError):
+        batch_get_block_timestamps(FakeWeb3(provider), [1])
+
+
+# --- retrying HTTP provider ---------------------------------------------------
+
+
+def test_http_provider_retries_then_succeeds(monkeypatch):
+    calls: list[int] = []
+
+    def flaky(self, method, params):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectionError("boom")
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x2a"}
+
+    monkeypatch.setattr(HTTPProvider, "make_request", flaky)
+    provider = RetryingHTTPProvider("http://localhost:1")
+    resp = provider.make_request(RPCEndpoint("eth_blockNumber"), [])
+    assert resp["result"] == "0x2a"
+    assert len(calls) == 2
+
+
+def test_http_provider_gives_up_after_max_attempts(monkeypatch):
+    calls: list[int] = []
+
+    def always_fails(self, method, params):
+        calls.append(1)
+        raise requests.exceptions.Timeout("slow")
+
+    monkeypatch.setattr(HTTPProvider, "make_request", always_fails)
+    monkeypatch.setattr(
+        rpc_module,
+        "_retry_kwargs",
+        lambda: {
+            "retry": rpc_module.retry_if_exception(rpc_module.is_retryable),
+            "stop": rpc_module.stop_after_attempt(rpc_module.MAX_ATTEMPTS),
+            "wait": wait_none(),
+            "before_sleep": lambda state: None,
+            "reraise": True,
+        },
+    )
+    provider = RetryingHTTPProvider("http://localhost:1")
+    with pytest.raises(requests.exceptions.Timeout):
+        provider.make_request(RPCEndpoint("eth_blockNumber"), [])
+    assert len(calls) == rpc_module.MAX_ATTEMPTS
+
+
+def test_http_provider_retries_batch(monkeypatch):
+    calls: list[int] = []
+
+    def flaky_batch(self, batch_requests):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectionError("boom")
+        return [
+            {
+                "jsonrpc": "2.0",
+                "id": i,
+                "result": {"number": hex(1), "timestamp": hex(2)},
+            }
+            for i, _ in enumerate(batch_requests)
+        ]
+
+    monkeypatch.setattr(HTTPProvider, "make_batch_request", flaky_batch)
+    provider = RetryingHTTPProvider("http://localhost:1")
+    resp = provider.make_batch_request([(RPCEndpoint("eth_getBlockByNumber"), ["0x1", False])])
+    assert len(resp) == 1
+    assert len(calls) == 2
+
+
 # --- websocket sync bridge --------------------------------------------------
 
 
@@ -101,8 +185,17 @@ def ws_server():
     async def handler(ws):
         async for raw in ws:
             req = json.loads(raw)
-            result = "0x2a" if req["method"] == "eth_blockNumber" else None
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+            entries = req if isinstance(req, list) else [req]
+            for entry in entries:
+                method = entry["method"]
+                if method == "eth_blockNumber":
+                    result = "0x2a"
+                elif method == "eth_getBlockByNumber":
+                    block = int(entry["params"][0], 16)
+                    result = {"number": hex(block), "timestamp": hex(100 + block * 100)}
+                else:
+                    result = None
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": entry["id"], "result": result}))
 
     def run() -> None:
         loop = asyncio.new_event_loop()
@@ -133,5 +226,13 @@ def test_ws_bridge_block_number(ws_server):
     w3 = make_client(f"ws://127.0.0.1:{ws_server}")
     try:
         assert w3.eth.block_number == 42
+    finally:
+        w3.provider.close()
+
+
+def test_ws_bridge_batch(ws_server):
+    w3 = make_client(f"ws://127.0.0.1:{ws_server}")
+    try:
+        assert batch_get_block_timestamps(w3, [1, 2]) == {1: 200, 2: 300}
     finally:
         w3.provider.close()

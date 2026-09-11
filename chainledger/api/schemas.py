@@ -7,11 +7,16 @@ from pydantic import BaseModel
 def format_value_decimal(value: int | Decimal | str, decimals: int) -> str:
     """Format a raw uint256 amount using the token's decimals.
 
-    Computed with Decimal arithmetic (never float) and rendered with exactly
-    `decimals` fraction digits, e.g. raw 1e18 with decimals 18 -> "1.000000000000000000".
+    Pure integer math (never float, never Decimal formatting): e.g. raw 1e18
+    with decimals 18 -> "1.000000000000000000". Decimal's own 'f' formatting
+    rounds huge coefficients to the context precision, so it is avoided here.
     """
-    scaled = Decimal(value).scaleb(-decimals)
-    return f"{scaled:.{decimals}f}"
+    raw = int(value)
+    sign = "-" if raw < 0 else ""
+    whole, frac = divmod(abs(raw), 10**decimals)
+    if decimals == 0:
+        return f"{sign}{whole}"
+    return f"{sign}{whole}.{frac:0{decimals}d}"
 
 
 class HealthToken(BaseModel):

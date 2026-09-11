@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import structlog
+from hexbytes import HexBytes
 from web3 import Web3
 from web3.types import LogReceipt
 
@@ -56,8 +57,10 @@ class TransferDecoder:
             return None
 
     def _decode(self, raw_log: dict[str, Any]) -> DecodedTransfer | None:
-        topics = raw_log.get("topics") or []
-        if not topics or Web3.to_hex(topics[0]).lower() != TRANSFER_TOPIC0.lower():
+        topics = [t for t in (raw_log.get("topics") or []) if t is not None]
+        # Topics arrive as bytes (HexBytes) from web3 or as hex strings from
+        # raw JSON fixtures; normalize both before comparing.
+        if not topics or Web3.to_hex(HexBytes(topics[0])).lower() != TRANSFER_TOPIC0.lower():
             self._skip()
             return None
         # ERC-20 and ERC-721 both define `Transfer(address,address,uint256)`,
@@ -72,7 +75,7 @@ class TransferDecoder:
         decoded = self._event.process_log(cast(LogReceipt, raw_log))
         args = decoded["args"]
         return DecodedTransfer(
-            tx_hash=Web3.to_hex(raw_log["transactionHash"]).lower(),
+            tx_hash=Web3.to_hex(HexBytes(raw_log["transactionHash"])).lower(),
             log_index=int(raw_log["logIndex"]),
             block_number=int(raw_log["blockNumber"]),
             token_address=str(raw_log["address"]).lower(),
