@@ -81,8 +81,9 @@ def main() -> None:
         raw.commit()
 
     elapsed = time.monotonic() - started
-    print(f"seeded {args.count:,} transfers in {elapsed:.2f}s "
-          f"({args.count / elapsed:,.0f} rows/sec)")
+    print(
+        f"seeded {args.count:,} transfers in {elapsed:.2f}s ({args.count / elapsed:,.0f} rows/sec)"
+    )
     print(f"token: {args.token}  blocks: {base_block}..{base_block + args.count // 5}")
 
 
